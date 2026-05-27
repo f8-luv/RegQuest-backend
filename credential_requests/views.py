@@ -4,13 +4,21 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.shortcuts import get_object_or_404
 from django.db.models import Count, Avg, F, Q
-from django.db.models.functions import TruncDate, TruncWeek
+from django.db.models.functions import TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
 from datetime import timedelta
+from calendar import month_name
+
 from .models import Request
 from .serializers import RequestSerializer
 from accounts.models import User
-from _core.permissions import IsAdminOrStaff, IsAdminUser, CanCancelOwnPendingRequest, IsVerifiedIfStudent
+from _core.permissions import (
+    IsAdminOrStaff,
+    IsAdminUser,
+    CanCancelOwnPendingRequest,
+    IsVerifiedIfStudent
+)
+
 
 class RequestViewSet(viewsets.ModelViewSet):
     queryset = Request.objects.all()
@@ -35,7 +43,7 @@ class RequestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        
+
         if not user.is_authenticated:
             return Request.objects.none()
 
@@ -43,7 +51,6 @@ class RequestViewSet(viewsets.ModelViewSet):
             return Request.objects.filter(user=user)
 
         return Request.objects.all()
-
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
@@ -60,81 +67,84 @@ class RequestViewSet(viewsets.ModelViewSet):
         req.status = Request.Status.CANCELLED
         req.save(update_fields=['status', 'updated_at'])
         return Response(
-            {
-            "message": "Request cancelled successfully", 
-            "status": req.status
-            }, 
+            {"message": "Request cancelled successfully", "status": req.status},
             status=status.HTTP_200_OK
-    )
+        )
 
     @action(detail=False, methods=['get'])
     def dashboard(self, request):
         now = timezone.now()
 
-        # Daily: last 7 days
-        daily_start = now - timedelta(days=6)
+    
         daily_qs = (
             Request.objects
-            .filter(created_at__gte=daily_start)
+            .filter(created_at__gte=now - timedelta(days=6))
             .annotate(day=TruncDate('created_at'))
             .values('day', 'document_type__document_name')
             .annotate(count=Count('id'))
-            .order_by('day')
         )
+
         daily_map = {}
         for row in daily_qs:
-            day_str = row['day'].strftime('%a')
-            if day_str not in daily_map:
-                daily_map[day_str] = {}
-            daily_map[day_str][row['document_type__document_name']] = row['count']
+            label = row['day'].strftime('%a')
+            daily_map.setdefault(label, {})
+            daily_map[label][row['document_type__document_name']] = row['count']
+
+        WEEK_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
         daily_data = []
         for i in range(6, -1, -1):
             d = now - timedelta(days=i)
             label = d.strftime('%a')
+            breakdown = daily_map.get(label, {})
+
             daily_data.append({
-                'label': label,
-                'date': d.strftime('%Y-%m-%d'),
-                'breakdown': daily_map.get(label, {}),
-                'total': sum(daily_map.get(label, {}).values()),
+                "label": label,
+                "date": d.strftime('%Y-%m-%d'),
+                "breakdown": breakdown,
+                "total": sum(breakdown.values()) if breakdown else 0,
             })
 
-        # Weekly: last 7 weeks
-        weekly_start = now - timedelta(weeks=6)
-        weekly_qs = (
+        daily_data = sorted(daily_data, key=lambda x: WEEK_ORDER.index(x["label"]))
+
+     
+        monthly_qs = (
             Request.objects
-            .filter(created_at__gte=weekly_start)
-            .annotate(week=TruncWeek('created_at'))
-            .values('week', 'document_type__document_name')
+            .filter(created_at__year=now.year)
+            .annotate(month=TruncMonth('created_at'))
+            .values('month', 'document_type__document_name')
             .annotate(count=Count('id'))
-            .order_by('week')
         )
-        weekly_map = {}
-        for row in weekly_qs:
-            week_str = row['week'].strftime('%Y-%W')
-            if week_str not in weekly_map:
-                weekly_map[week_str] = {}
-            weekly_map[week_str][row['document_type__document_name']] = row['count']
 
-        weekly_data = []
-        for i in range(6, -1, -1):
-            w = now - timedelta(weeks=i)
-            week_str = w.strftime('%Y-%W')
-            weekly_data.append({
-                'label': f'Week {7 - i}',
-                'week': week_str,
-                'breakdown': weekly_map.get(week_str, {}),
-                'total': sum(weekly_map.get(week_str, {}).values()),
+        monthly_map = {}
+
+        for row in monthly_qs:
+            month_num = row['month'].month
+            monthly_map.setdefault(month_num, {})
+            monthly_map[month_num][row['document_type__document_name']] = row['count']
+
+        monthly_data = []
+
+        for month_num in range(1, 13):
+            breakdown = monthly_map.get(month_num, {})
+
+            monthly_data.append({
+                "label": month_name[month_num],
+                "breakdown": breakdown,
+                "total": sum(breakdown.values()) if breakdown else 0,
             })
 
-        # Document type distribution
+     
+
         total_requests = Request.objects.count()
+
         doc_type_qs = (
             Request.objects
             .values('document_type__document_name')
             .annotate(count=Count('id'))
             .order_by('-count')
         )
+
         doc_distribution = [
             {
                 'name': row['document_type__document_name'],
@@ -144,9 +154,8 @@ class RequestViewSet(viewsets.ModelViewSet):
             for row in doc_type_qs
         ]
 
-        # Staff performance
         staff_users = User.objects.filter(role__in=[User.Roles.STAFF, User.Roles.ADMIN])
-        
+
         stats_qs = (
             Request.objects
             .filter(processed_by__in=staff_users)
@@ -154,37 +163,39 @@ class RequestViewSet(viewsets.ModelViewSet):
             .annotate(
                 completed=Count('id', filter=Q(status=Request.Status.COMPLETED)),
                 pending=Count('id', filter=Q(status__in=[Request.Status.PENDING, Request.Status.PROCESSING])),
-                avg_duration=Avg(F('processed_at') - F('created_at'), filter=Q(status=Request.Status.COMPLETED, processed_at__isnull=False))
+                avg_duration=Avg(F('processed_at') - F('created_at'), filter=Q(status=Request.Status.COMPLETED))
             )
         )
+
         stats_map = {row['processed_by']: row for row in stats_qs}
 
         staff_performance = []
+
         for staff in staff_users:
             stats = stats_map.get(staff.id, {})
-            completed = stats.get('completed', 0)
-            pending = stats.get('pending', 0)
             avg_duration = stats.get('avg_duration')
-
-            avg_days = None
-            if avg_duration is not None:
-                # avg_duration is a timedelta object on Python side
-                avg_days = round(avg_duration.total_seconds() / 86400, 1)
 
             staff_performance.append({
                 'id': staff.id,
                 'name': f'{staff.first_name} {staff.last_name}'.strip() or staff.username,
                 'username': staff.username,
                 'role': staff.role,
-                'completed': completed,
-                'pending': pending,
-                'avg_days': avg_days,
+                'completed': stats.get('completed', 0),
+                'pending': stats.get('pending', 0),
+                'avg_days': round(avg_duration.total_seconds() / 86400, 1) if avg_duration else None,
             })
+
         staff_performance.sort(key=lambda x: x['completed'], reverse=True)
 
         return Response({
-            'request_volume': {'daily': daily_data, 'weekly': weekly_data},
+            'request_volume': {
+                'daily': daily_data,
+                'monthly': monthly_data
+            },
             'document_type_distribution': doc_distribution,
             'staff_performance': staff_performance,
-            'meta': {'total_requests': total_requests, 'generated_at': now.isoformat()},
+            'meta': {
+                'total_requests': total_requests,
+                'generated_at': now.isoformat()
+            }
         })
